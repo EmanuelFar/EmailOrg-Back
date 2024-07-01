@@ -12,3 +12,4 @@ The **AI-Powered Gmail Organizer** is a tool that uses FastAPI and GPT-based mod
 - **User-Defined Criteria**: Allows customization of email filtering rules.
 - **AI-Powered**: Uses GPT-based models for intelligent email content analysis.
 - **Integration with Gmail API**: Seamlessly integrates with Gmail to manage emails.
+- **Bulk Email Remove** Removes A big amout of mails sent by a speciifc user or recent emails.
