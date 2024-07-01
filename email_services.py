@@ -61,141 +61,135 @@ async def start_gmail_watch(user_email):
 
 
 async def get_new_email_messages_from_watch(webhook_email, webhook_history_id):
-    # Retrieve credentials from MongoDB based on the webhook email
+    """
+    Retrieves new email messages from Gmail history using webhook information.
+    """
+    # Retrieve credentials and user labels from the database
     credentials_doc = await create_credentials(webhook_email)
-    user_labels = db_users.find_one({"email": webhook_email}).get("labels")
+    user_info = db_users.find_one({"email": webhook_email})
+    user_labels = user_info.get("labels")
+    start_label = user_info.get("startLabel") == "True"
 
-    # Check for credentials and startLabel flag in the collection
-    if credentials_doc:
-        if db_users.find_one({"email": webhook_email}).get("startLabel") == "True":
-            # Use credentials to interact with Gmail API
-            service = googleapiclient.discovery.build('gmail', 'v1', credentials=credentials_doc)
-            # Fetch history from Gmail API
-            response = service.users().history().list(userId='me', startHistoryId=webhook_history_id).execute()
-            changes_raw = response.get('history')
-            if not changes_raw:
-                print("no new changes")
-                return
-
-            # Filter new messages from history
-            changes_filtered = [d for d in changes_raw if 'messagesAdded' in d]
-            if len(changes_filtered) == 0:
-                print('No new messages')
-                return
-
-            # Extract added messages and flatten the list
-            messages_added_values_raw = [item['messagesAdded'] for item in changes_filtered]
-            messages_added_values_filtered = []
-            [messages_added_values_filtered.extend(item) for item in messages_added_values_raw]
-
-            for message in messages_added_values_filtered:
-                already_labeled = False
-                print(message)
-                new_message_id = message['message']['id']
-
-                # Check if the message is already labeled
-                for user_label_id in service.users().messages().get(userId='me', id=new_message_id).execute().get(
-                        'labelIds'):
-                    if user_label_id.startswith('Label_'):
-                        already_labeled = True
-                        print("Already labeled")
-                        
-                if not already_labeled:
-                    # Retrieve email details using the message ID
-                    email = service.users().messages().get(userId='me', id=new_message_id).execute()
-                    for header in email['payload']['headers']:
-                        if header['name'] == 'Subject':
-                            subject = header['value']
-                            break
-                    if 'subject' in locals():
-                        print('Subject:', subject)
-                        print('Email Content:', email['snippet'])
-
-                        # Call function to determine label and apply it to the message
-                        label = await gpt_call(user_labels, subject, email['snippet'])
-                        labelize_message(new_message_id, label, credentials_doc)
-                    else:
-                        print('Subject not found')
-                else:
-                    continue
-        else:
-            print("Please Enable Gmail watch!")
-    else:
+    # If credentials are not found or startLabel is not enabled, exit early
+    if not credentials_doc:
         print("No credentials found for this email")
-    return
+        return
+
+    if not start_label:
+        print("Please Enable Gmail watch!")
+        return
+
+    # Use credentials to interact with Gmail API
+    service = googleapiclient.discovery.build('gmail', 'v1', credentials=credentials_doc)
+    # Fetch history from Gmail API
+    response = service.users().history().list(userId='me', startHistoryId=webhook_history_id).execute()
+    changes_raw = response.get('history')
+
+    if not changes_raw:
+        print("No new changes")
+        return
+
+    # Filter new messages from history
+    messages_added = [
+        message['messagesAdded']
+        for change in changes_raw
+        if 'messagesAdded' in change
+    ]
+    
+    if not messages_added:
+        print("No new messages")
+        return
+
+    # Flatten the list of added messages
+    messages_flat = [msg for sublist in messages_added for msg in sublist]
+
+    # Process each new message
+    for message in messages_flat:
+        new_message_id = message['message']['id']
+        email = service.users().messages().get(userId='me', id=new_message_id).execute()
+
+        # Check if the message is already labeled
+        if any(label.startswith('Label_') for label in email.get('labelIds', [])):
+            print("Already labeled")
+            continue
+
+        # Extract subject and snippet
+        subject = next((header['value'] for header in email['payload']['headers'] if header['name'] == 'Subject'), None)
+        snippet = email.get('snippet')
+
+        if subject:
+            print('Subject:', subject)
+            print('Email Content:', snippet)
+
+            # Call function to determine label and apply it to the message
+            label = await gpt_call(user_labels, subject, snippet)
+            labelize_message(new_message_id, label, credentials_doc)
+        else:
+            print('Subject not found')
+
 
 
 async def filter_last_emails_by_sender(user_email: str, sender_email: str, label_chosen: str, num_of_messages: int):
-    # Define email addresses, label, and retrieve user credentials
+    """
+    Filters the last 'num_of_messages' emails from 'sender_email' and labels them under the specified 'label_chosen'.
+    """
     sender_name = sender_email.split('@')[0]
+    
+    # Retrieve user credentials and Gmail service
     credentials_doc = await create_credentials(user_email)
     service = googleapiclient.discovery.build(API_SERVICE_NAME, API_VERSION, credentials=credentials_doc)
-
+    
     # Get IDs of the last X emails from the sender
-    results = service.users().messages().list(userId='me', q=f'from:{sender_email}',
-                                              maxResults=num_of_messages).execute()
-    messages = results.get('messages', [])
-    parent_label_id = None
-    labels = service.users().labels().list(userId='me').execute().get('labels', [])
-    # Check if parent label (sender's name) exists
-    for label in labels:
-        if label['type'] == 'user' and label['name'] == sender_name:
-            parent_label_id = label['id']
-            break
-
-    # If parent label doesn't exist, create it
-    if not parent_label_id:
-        new_label = {'messageListVisibility': 'show', 'name': sender_name, 'labelListVisibility': 'labelShow'}
-        created_label = service.users().labels().create(userId='me', body=new_label).execute()
-        parent_label_id = created_label['id']
-
-    # Define son label name and check if it exists
+    messages = get_last_emails_from_sender(service, sender_email, num_of_messages)
+    if not messages:
+        print("No messages found from the sender.")
+        return
+    
+    # Ensure parent and child labels exist
+    parent_label_id = await get_or_create_label(service, sender_name)
     son_label_name = f"{sender_name}/{label_chosen}"
-    son_label_id = None
+    son_label_id = await get_or_create_label(service, son_label_name)
 
-    for label in labels:
-        if label['type'] == 'user' and label['name'] == son_label_name:
-            son_label_id = label['id']
-            break
-
-    # If son label doesn't exist, create it
-    if not son_label_id:
-        son_label = {'messageListVisibility': 'show', 'name': son_label_name, 'labelListVisibility': 'labelShow'}
-        son_label = service.users().labels().create(userId='me', body=son_label).execute()
-        son_label_id = son_label['id']
-
-    # Loop through the messages from the sender
+    # Process and label the messages
     for message in messages:
-        email_id = message['id']
-        msg = service.users().messages().get(userId='me', id=email_id).execute()
-        #If the message is already labeled, skip
-        msg_labels_list = msg.get('labelIds', [])
-        if son_label_id in msg_labels_list:
-            print("Already labeled!")
-            continue
+        await process_and_label_message(service, message, son_label_id, label_chosen)
 
-        # Extract email subject
-        for header in msg['payload']['headers']:
-            if header['name'] == 'Subject':
-                subject = header['value']
-                break
+async def get_last_emails_from_sender(service, sender_email: str, num_of_messages: int):
+    results = service.users().messages().list(userId='me', q=f'from:{sender_email}', maxResults=num_of_messages).execute()
+    return results.get('messages', [])
 
-        # Check if subject exists and print email content
-        if 'subject' in locals():
-            # Call function to determine label and apply it to the message
-            if await gpt_call_filter_by_sender(label_chosen, subject, msg['snippet']) == 'Yes':
-                service.users().messages().modify(userId='me', id=email_id,
-                                                  body={'addLabelIds': [son_label_id]}).execute()
-        else:
-            print('Subject not found')
-#checks for the user email inside data, search if user in data base, return stored historyid, update to the new history
-async def fetch_historyid_update_webhook(data):
-    user_email = data["emailAddress"]
-    new_history_id = data["historyId"]
-    filter_criteria = {"email": user_email}
-    update_data = {"$set": {"historyId": new_history_id}}
-    db_users.update_one(filter_criteria, update_data, upsert=True)
-    return new_history_id if not db_users.find_one({"email": user_email}).get("historyId") else data["historyId"]
+async def get_or_create_label(service, label_name: str):
+    labels = service.users().labels().list(userId='me').execute().get('labels', [])
+    for label in labels:
+        if label['type'] == 'user' and label['name'] == label_name:
+            return label['id']
+    
+    new_label = {
+        'messageListVisibility': 'show',
+        'name': label_name,
+        'labelListVisibility': 'labelShow'
+    }
+    created_label = service.users().labels().create(userId='me', body=new_label).execute()
+    return created_label['id']
+
+async def process_and_label_message(service, message, label_id: str, label_chosen: str):
+    email_id = message['id']
+    msg = service.users().messages().get(userId='me', id=email_id).execute()
+    
+    if label_id in msg.get('labelIds', []):
+        print("Already labeled!")
+        return
+    
+    subject = next((header['value'] for header in msg['payload']['headers'] if header['name'] == 'Subject'), None)
+    snippet = msg.get('snippet')
+
+    if subject:
+        if await gpt_call_filter_by_sender(label_chosen, subject, snippet) == 'Yes':
+            service.users().messages().modify(userId='me', id=email_id, body={'addLabelIds': [label_id]}).execute()
+    else:
+        print('Subject not found')
+
+
 
 
 async def create_labels(user_chosen_labels: list, user_email: str):
