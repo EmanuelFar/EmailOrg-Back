@@ -1,6 +1,6 @@
 # AI-Powered Gmail Organizer
 
-![Demo](https://github.com/your-username/your-repo-name/path-to-your-gif.gif)
+![Demo](https://github.com/EmanuelFar/EmailOrg-Back/blob/main/EmailOrg-gif.gif)
 
 ## Overview
 
